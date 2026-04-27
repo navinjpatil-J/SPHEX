@@ -50,6 +50,6 @@ this tool is designed to quantify.
 ## Installation
 
 ```bash
-git clone https://github.com/YourGitHubUsername/SPHEX.git
+git clone https://github.com/navinjpatil-J/SPHEX.git
 cd SPHEX
 pip install -r requirements.txt
