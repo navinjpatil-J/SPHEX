@@ -1,6 +1,6 @@
 # ============================================================
 # SPHEX — Spectral Pattern Heterogeneity indeX Analyzer
-# v1.1.1
+# v1.2.0
 # ============================================================
 #
 # A multiscale framework for quantitative AFM biofilm surface
@@ -12,7 +12,7 @@
 # project root for full license information.
 #
 # Author: Navinkumar Patil
-# # Contact: [navinjpatil@gmail.com]
+# Contact: navinjpatil@gmail.com
 #
 # Reference:
 #   Navinkumar Patil (2025). SPHEX: Spectral Pattern
@@ -22,6 +22,24 @@
 # Dependencies:
 #   numpy, scipy, scikit-image, PyWavelets,
 #   tifffile, matplotlib, pandas, openpyxl
+#
+# v1.2.0 Changes (applied over v1.1.1):
+#   6. Replaced broken OPD-derived Fractal_Dim with a
+#      PSD-slope-based estimate (D_f = 4 - beta/2).
+#      Root cause of bug: orthogonal_pdf_decomposition()
+#      recursion reduced to uniform PDF scaling at every
+#      level because phi_plus + phi_minus == current_pdf
+#      by construction, making the energy ratio between
+#      levels a fixed constant (0.75^2) regardless of image
+#      content. This produced Fractal_Dim = 2.830075 for
+#      every image. The new estimate_fractal_dimension_psd()
+#      function computes the slope of the radial PSD on a
+#      log-log scale and applies D_f = 4 - beta/2, which
+#      is correct for mean-based 2D radial averaging.
+#   7. Set OPD_Energy_Gap and OPD_Dominant_Scale to NaN in
+#      all output DataFrames because both are image-
+#      independent constants under the current OPD recursion.
+#   8. Updated Excel Units_Legend sheet accordingly.
 #
 # v1.1.1 Changes:
 #   1. Fixed CV calculation in multiscale_heterogeneity()
@@ -35,7 +53,7 @@
 # Section 0: Version & Configuration
 # ========================
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __author__ = "NAVINKUMAR PATIL"
 __license__ = "MIT"
 
@@ -212,6 +230,14 @@ class AFMConfig:
         Lower percentile bound for robust Rt calculation.
     RT_ROBUST_UPPER_PERCENTILE : float
         Upper percentile bound for robust Rt calculation.
+    PSD_FRACTAL_N_BINS : int
+        Number of logarithmic bins for PSD-based fractal estimate.
+    PSD_FRACTAL_FIT_LOW_QUANTILE : float
+        Lower quantile of frequency bins used in fractal fit.
+    PSD_FRACTAL_FIT_HIGH_QUANTILE : float
+        Upper quantile of frequency bins used in fractal fit.
+    PSD_FRACTAL_MIN_POINTS : int
+        Minimum number of valid bins required for fractal fit.
     """
 
     # OPD Parameters (Liu et al. 2015)
@@ -264,6 +290,12 @@ class AFMConfig:
     # Robust Rt percentile bounds
     RT_ROBUST_LOWER_PERCENTILE: float = 0.5
     RT_ROBUST_UPPER_PERCENTILE: float = 99.5
+
+    # PSD-based fractal dimension parameters (v1.2.0)
+    PSD_FRACTAL_N_BINS: int = 60
+    PSD_FRACTAL_FIT_LOW_QUANTILE: float = 0.15
+    PSD_FRACTAL_FIT_HIGH_QUANTILE: float = 0.65
+    PSD_FRACTAL_MIN_POINTS: int = 12
 
 
 # ========================
@@ -335,27 +367,21 @@ def validate_image_array(
     >>> validated.dtype
     dtype('float64')
     """
-    # Check for None
     if image is None:
         raise InvalidImageError(
             f"[{function_name}] Image is None. "
             "Please provide a valid numpy array."
         )
 
-    # Check type
     if not isinstance(image, np.ndarray):
         raise InvalidImageError(
             f"[{function_name}] Expected numpy array, "
             f"got {type(image).__name__}."
         )
 
-    # Convert to float64
     image = image.astype(np.float64)
-
-    # Squeeze singleton dimensions
     image = image.squeeze()
 
-    # Check dimensionality
     if image.ndim != 2:
         raise InvalidImageError(
             f"[{function_name}] Expected 2D array, "
@@ -364,7 +390,6 @@ def validate_image_array(
             "For z-stacks, select a single slice."
         )
 
-    # Check minimum size
     min_size = 8
     if image.shape[0] < min_size or image.shape[1] < min_size:
         raise InvalidImageError(
@@ -372,19 +397,16 @@ def validate_image_array(
             f"Minimum size is {min_size}x{min_size} pixels."
         )
 
-    # Check for all-NaN
     if np.all(np.isnan(image)):
         raise InvalidImageError(
             f"[{function_name}] Image contains only NaN values."
         )
 
-    # Check for all-Inf
     if np.all(np.isinf(image)):
         raise InvalidImageError(
             f"[{function_name}] Image contains only Inf values."
         )
 
-    # Handle partial NaN/Inf
     n_nan = np.sum(np.isnan(image))
     n_inf = np.sum(np.isinf(image))
 
@@ -399,8 +421,6 @@ def validate_image_array(
         bad_mask = ~np.isfinite(image)
         image[bad_mask] = np.nanmedian(image)
 
-    # Check for constant image
-    # FIXED: np.ptp() deprecated → use np.max() - np.min()
     image_range = np.max(image) - np.min(image)
     if image_range < AFMConfig.NUMERICAL_EPSILON:
         logger.warning(
@@ -506,12 +526,6 @@ def extract_jpk_metadata(tif: TiffFile) -> Dict:
         - 'scan_size_y_nm' (float or None): Y scan size in nm
         - 'pixel_size_nm' (float or None): Pixel size in nm
         - 'success' (bool): True if any metadata was extracted
-
-    Notes
-    -----
-    JPK instruments have changed metadata key names across
-    software versions. The multi-key fallback strategy
-    provides backward compatibility.
 
     Examples
     --------
@@ -834,23 +848,228 @@ def load_afm_image(image_path: Union[str, Path]) -> np.ndarray:
 
 
 # ========================
+# Section 6c: PSD-Based Fractal Dimension (v1.2.0)
+# ========================
+
+def estimate_fractal_dimension_psd(
+    image: np.ndarray,
+    n_bins: int = AFMConfig.PSD_FRACTAL_N_BINS,
+    fit_low_quantile: float = AFMConfig.PSD_FRACTAL_FIT_LOW_QUANTILE,
+    fit_high_quantile: float = AFMConfig.PSD_FRACTAL_FIT_HIGH_QUANTILE,
+    min_points: int = AFMConfig.PSD_FRACTAL_MIN_POINTS
+) -> float:
+    """
+    Estimate surface fractal dimension from the radial PSD slope.
+
+    For a self-affine 2D surface with Hurst exponent H:
+        PSD_2D(q) ~ q^(-(2 + 2H))
+
+    Taking the mean over isotropic annuli preserves this exponent,
+    so fitting the log-log slope beta of the radially averaged PSD
+    gives:
+        beta = 2 + 2H
+        H = (beta - 2) / 2
+        D_f = 3 - H = 4 - beta / 2
+
+    This replaces the previous OPD-derived fractal dimension, which
+    was found to return a constant value (2.830075) for all images
+    due to a structural flaw in the OPD recursion (v1.1.1 and
+    earlier). Root cause: phi_plus + phi_minus == current_pdf by
+    construction, so the update current_pdf = OPD_ENERGY_DECAY *
+    (phi_plus + phi_minus) reduces to uniform scaling by 0.75 at
+    every level. The normalized energy ratio is therefore fixed
+    regardless of image content.
+
+    The new PSD-slope estimate is pixel-size independent (changing
+    from cycles/pixel to cycles/nm shifts only the intercept, not
+    the slope), and uses frequencies in cycles per pixel internally
+    for this reason.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2D AFM height image array (nm), already zero-meaned.
+    n_bins : int
+        Number of logarithmic radial frequency bins.
+        Default: AFMConfig.PSD_FRACTAL_N_BINS (60).
+    fit_low_quantile : float
+        Lower quantile of frequency bins used for the power-law fit.
+        Default: AFMConfig.PSD_FRACTAL_FIT_LOW_QUANTILE (0.15).
+    fit_high_quantile : float
+        Upper quantile of frequency bins used for the power-law fit.
+        Default: AFMConfig.PSD_FRACTAL_FIT_HIGH_QUANTILE (0.65).
+    min_points : int
+        Minimum number of valid bins required for a fit.
+        Default: AFMConfig.PSD_FRACTAL_MIN_POINTS (12).
+
+    Returns
+    -------
+    fractal_dim : float
+        Estimated fractal dimension, constrained to [2.0, 3.0].
+        Returns NaN if the estimate is unreliable, insufficient
+        data, or the result falls outside the physical range.
+
+    Notes
+    -----
+    The formula D_f = 4 - beta/2 is correct specifically when the
+    radial averaging uses np.mean over each annulus (mean-based
+    averaging). If summed or count-weighted averaging were used, the
+    exponent relationship changes to D_f = 3.5 - beta/2.
+
+    Examples
+    --------
+    >>> img = np.random.normal(0, 10, (256, 256))
+    >>> D = estimate_fractal_dimension_psd(img)
+    >>> 2.0 <= D <= 3.0 or np.isnan(D)
+    True
+    """
+    image = validate_image_array(image, "estimate_fractal_dimension_psd")
+
+    ny, nx = image.shape
+    image_centered = image - np.mean(image)
+
+    # 2D Hann window to reduce spectral leakage
+    hann_y = np.hanning(ny)
+    hann_x = np.hanning(nx)
+    window = np.outer(hann_y, hann_x)
+    windowed = image_centered * window
+
+    # FFT — use cycles/pixel (d=1.0) so the slope is unit-independent
+    fft_result = fftshift(fft2(windowed))
+    power = np.abs(fft_result) ** 2
+
+    freq_x = np.fft.fftshift(np.fft.fftfreq(nx, d=1.0))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(ny, d=1.0))
+
+    fx_grid, fy_grid = np.meshgrid(freq_x, freq_y)
+    radial_freq = np.sqrt(fx_grid ** 2 + fy_grid ** 2)
+
+    valid = (
+        (radial_freq > 0)
+        & np.isfinite(radial_freq)
+        & np.isfinite(power)
+        & (power > 0)
+    )
+
+    if not np.any(valid):
+        logger.warning(
+            "Fractal dimension PSD estimate failed: no valid frequencies."
+        )
+        return np.nan
+
+    freqs = radial_freq[valid]
+    powers = power[valid]
+
+    f_min = np.min(freqs[freqs > 0])
+    f_max = np.max(freqs)
+
+    if f_max <= f_min:
+        logger.warning(
+            "Fractal dimension PSD estimate failed: "
+            "invalid frequency range."
+        )
+        return np.nan
+
+    bin_edges = np.logspace(
+        np.log10(f_min), np.log10(f_max), n_bins + 1
+    )
+
+    radial_f = []
+    radial_p = []
+
+    for i in range(n_bins):
+        mask = (freqs >= bin_edges[i]) & (freqs < bin_edges[i + 1])
+        if np.sum(mask) >= 5:
+            radial_f.append(np.sqrt(bin_edges[i] * bin_edges[i + 1]))
+            radial_p.append(np.mean(powers[mask]))
+
+    radial_f = np.asarray(radial_f)
+    radial_p = np.asarray(radial_p)
+
+    valid_bins = (
+        np.isfinite(radial_f)
+        & np.isfinite(radial_p)
+        & (radial_f > 0)
+        & (radial_p > 0)
+    )
+
+    radial_f = radial_f[valid_bins]
+    radial_p = radial_p[valid_bins]
+
+    if len(radial_f) < min_points:
+        logger.warning(
+            "Fractal dimension PSD estimate failed: "
+            "insufficient radial PSD bins "
+            f"({len(radial_f)} < {min_points})."
+        )
+        return np.nan
+
+    low = np.quantile(radial_f, fit_low_quantile)
+    high = np.quantile(radial_f, fit_high_quantile)
+
+    fit_mask = (radial_f >= low) & (radial_f <= high)
+
+    if np.sum(fit_mask) < min_points:
+        logger.warning(
+            "Fractal dimension PSD estimate failed: "
+            f"insufficient points in fit range ({np.sum(fit_mask)} "
+            f"< {min_points})."
+        )
+        return np.nan
+
+    log_f = np.log10(radial_f[fit_mask])
+    log_p = np.log10(radial_p[fit_mask])
+
+    slope, intercept, r_value, p_value, std_err = linregress(log_f, log_p)
+
+    # beta is the positive exponent: PSD ~ f^(-beta)
+    beta = -slope
+    # D_f = 4 - beta/2 for 2D mean-averaged radial PSD of self-affine surface
+    fractal_dim = 4.0 - beta / 2.0
+
+    if not np.isfinite(fractal_dim):
+        logger.warning(
+            "Fractal dimension PSD estimate is not finite. "
+            "Returning NaN."
+        )
+        return np.nan
+
+    if fractal_dim < 2.0 or fractal_dim > 3.0:
+        logger.warning(
+            f"PSD-derived fractal dimension outside physical surface "
+            f"range [2.0, 3.0]: D_f={fractal_dim:.4f}, "
+            f"beta={beta:.4f}, R2={r_value**2:.4f}. "
+            "Returning NaN."
+        )
+        return np.nan
+
+    logger.debug(
+        f"PSD fractal estimate: D_f={fractal_dim:.4f}, "
+        f"beta={beta:.4f}, slope={slope:.4f}, "
+        f"R2={r_value**2:.4f}, std_err={std_err:.4f}"
+    )
+
+    return float(fractal_dim)
+
+
+# ========================
 # Section 7: ISO 4287 Roughness Metrics
 # ========================
 
 def calculate_roughness_metrics(image: np.ndarray) -> Dict:
     """
     Calculate ISO 4287 surface roughness parameters with
-    Fisher-Pearson bias correction, OPD fractal dimension,
-    and robust Rt.
+    Fisher-Pearson bias correction, PSD-derived surface
+    fractal dimension, and robust Rt.
 
     Implements:
-    - Ra:        arithmetic mean roughness
-    - Rq:        root mean square roughness
-    - Rt:        maximum height (peak-to-valley, ISO 4287 strict)
-    - Rt_Robust: peak-to-valley from P0.5 to P99.5 (spike-resistant)
-    - Rsk:       skewness with Fisher-Pearson bias correction
-    - Rku:       excess kurtosis with Pearson bias correction
-    - Fractal_Dim: OPD-derived fractal dimension estimate
+    - Ra:          arithmetic mean roughness
+    - Rq:          root mean square roughness
+    - Rt:          maximum height (peak-to-valley, ISO 4287 strict)
+    - Rt_Robust:   peak-to-valley from P0.5 to P99.5 (spike-resistant)
+    - Rsk:         skewness with Fisher-Pearson bias correction
+    - Rku:         excess kurtosis with Pearson bias correction
+    - Fractal_Dim: PSD-derived surface fractal dimension estimate
 
     Parameters
     ----------
@@ -883,7 +1102,6 @@ def calculate_roughness_metrics(image: np.ndarray) -> Dict:
     deviations = image - mean_z
     n_pixels = deviations.size
 
-    # FIXED: Move eps before with block for cleaner scope
     eps = AFMConfig.NUMERICAL_EPSILON
 
     with warnings.catch_warnings():
@@ -892,7 +1110,6 @@ def calculate_roughness_metrics(image: np.ndarray) -> Dict:
         Ra = float(np.mean(np.abs(deviations)))
         Rq = float(np.sqrt(np.mean(deviations**2)))
 
-        # FIXED: np.ptp() deprecated → np.max() - np.min()
         Rt = float(np.max(image) - np.min(image))
 
         Rt_robust = float(
@@ -925,23 +1142,21 @@ def calculate_roughness_metrics(image: np.ndarray) -> Dict:
             Rku = np.nan
             logger.warning("Too few pixels for kurtosis calculation.")
 
-    # OPD Fractal Dimension
+    # PSD-derived surface fractal dimension (v1.2.0)
+    # NOTE: The previous OPD-based fractal dimension calculation was
+    # found to return a constant value (2.830075) for all images.
+    # Root cause: current_pdf = OPD_ENERGY_DECAY * (phi_plus + phi_minus)
+    # reduces to a uniform scaling of the PDF by a fixed constant at
+    # every level, since phi_plus + phi_minus == current_pdf by
+    # construction. This makes the energy ratio between levels fixed
+    # regardless of image content. Replaced with a PSD-slope-based
+    # estimate using D_f = 4 - beta/2, which varies correctly with
+    # image structure and is mathematically correct for mean-based
+    # 2D radial averaging of a self-affine surface.
     try:
-        opd_results = orthogonal_pdf_decomposition(image)
-        energy_spectrum = opd_results['energy_spectrum']
-
-        if (len(energy_spectrum) >= 2
-                and energy_spectrum[1] > eps):
-            ratio = energy_spectrum[0] / energy_spectrum[1]
-            if ratio > 0:
-                fractal_dim = float(2.0 + np.log2(ratio))
-            else:
-                fractal_dim = np.nan
-        else:
-            fractal_dim = np.nan
-
+        fractal_dim = estimate_fractal_dimension_psd(image)
     except Exception as e:
-        logger.warning(f"OPD fractal dimension failed: {e}")
+        logger.warning(f"PSD fractal dimension failed: {e}")
         fractal_dim = np.nan
 
     return {
@@ -1101,7 +1316,6 @@ def radial_average_psd(
     freq_bins = []
     radial_psd_vals = []
 
-    # FIXED: Added comment for clarity (Issue C)
     # n_bins edges produce n_bins-1 usable intervals
     for i in range(1, n_bins):
         mask = bin_indices == i
@@ -1184,7 +1398,6 @@ def calculate_directional_cv(
     if mean_val < AFMConfig.NUMERICAL_EPSILON:
         return 0.0
 
-    # FIXED: Changed ddof=0 to ddof=1 for consistency (Issue D)
     cv_fourier = float(
         (np.std(sector_means, ddof=1) / mean_val) * 100.0
     )
@@ -1323,7 +1536,6 @@ def calculate_pip_metrics(
         cv_pip = 0.0
     else:
         std_filtered = float(np.std(filtered, ddof=1))
-
         cv_pip = float(
             (std_filtered / (delta_pip + AFMConfig.NUMERICAL_EPSILON))
             * 100.0
@@ -1481,6 +1693,18 @@ def orthogonal_pdf_decomposition(
     """
     Orthogonal PDF Decomposition (OPD) following Liu et al. (2015).
 
+    NOTE (v1.2.0): The energy_gap and dominant_scale outputs of this
+    function are no longer used in the main analysis pipeline because
+    they were found to be image-independent constants. The root cause
+    is that phi_plus + phi_minus == current_pdf by construction, so
+    the recursion current_pdf = OPD_ENERGY_DECAY * (phi_plus +
+    phi_minus) reduces to uniform scaling by 0.75 at every level.
+    The normalized energy spectrum is therefore fixed regardless of
+    image content, producing energy_gap = 0.202828 and
+    dominant_scale = 0 for every image. The function is retained for
+    the OPD energy spectrum plot and for potential future use once
+    the recursion is corrected.
+
     Parameters
     ----------
     image : np.ndarray
@@ -1492,7 +1716,8 @@ def orthogonal_pdf_decomposition(
     -------
     results : dict
         Dictionary with keys:
-        - 'energy_spectrum', 'approximations', 'dominant_scale', 'energy_gap'
+        - 'energy_spectrum', 'approximations', 'dominant_scale',
+          'energy_gap'
 
     Examples
     --------
@@ -1814,11 +2039,7 @@ def multiscale_heterogeneity(
         mean_f = float(np.mean(filtered))
         std_f = float(np.std(filtered, ddof=1))
 
-        # FIXED v1.1.1 (Issue A — Critical):
-        # Use delta_f = q95 - q5 as denominator (consistent with CV_PIP)
-        # instead of |mean_f| which is always ≈0 for zero-mean AFM images.
         delta_f = q95 - q5
-
         cv = (float(std_f / (delta_f + AFMConfig.NUMERICAL_EPSILON) * 100.0)
               if delta_f > AFMConfig.NUMERICAL_EPSILON else 0.0)
 
@@ -1871,6 +2092,14 @@ def directional_analysis(
     -------
     metrics : dict
         Directional power and anisotropy metrics.
+
+    Notes
+    -----
+    Anisotropy_Index is informative and varies with image structure.
+    Primary_Direction_deg reflects the absolute scan orientation and
+    should not be interpreted biologically unless all samples were
+    mounted and scanned in the same physical orientation relative to
+    a fixed reference direction.
 
     Examples
     --------
@@ -2030,7 +2259,14 @@ def generate_validation_surface() -> np.ndarray:
 
 def validate_roughness_calibration() -> bool:
     """
-    NIST SRM 2073-traceable validation of all roughness metrics.
+    NIST SRM 2073-traceable validation of roughness metrics.
+
+    NOTE (v1.2.0): The OPD energy gap criterion is retained for
+    backward compatibility, but its pass/fail status should be
+    interpreted with caution because energy_gap is currently a
+    constant (approximately 0.2028) regardless of surface structure.
+    The Ra, Rsk, and Rku checks remain fully valid and are the
+    primary calibration tests.
 
     Returns
     -------
@@ -2096,6 +2332,7 @@ def validate_roughness_calibration() -> bool:
     gap_msg = (
         f"  OPD Energy Gap: {energy_gap:.4f} "
         f"(min={AFMConfig.NIST_ENERGY_GAP_MIN})  {gap_status}"
+        f"  [NOTE: currently a structural constant, not image-dependent]"
     )
     logger.info(gap_msg)
 
@@ -2269,6 +2506,10 @@ def plot_opd_spectrum(
     """
     Visualize OPD energy spectrum.
 
+    NOTE (v1.2.0): The OPD energy spectrum is currently a structural
+    constant and should not be interpreted as image-dependent. This
+    plot is retained for diagnostic and development purposes only.
+
     Parameters
     ----------
     opd_results : dict
@@ -2290,7 +2531,11 @@ def plot_opd_spectrum(
                          color='darkgreen', linewidth=2, markersize=8)
         axes[0].set_xlabel('Decomposition Level', fontsize=11)
         axes[0].set_ylabel('Normalized Energy (log scale)', fontsize=11)
-        axes[0].set_title('OPD Energy Spectrum', fontsize=12)
+        axes[0].set_title(
+            'OPD Energy Spectrum\n'
+            '[NOTE: currently image-independent — see v1.2.0 changelog]',
+            fontsize=10
+        )
         axes[0].grid(True, which='both', alpha=0.3)
         axes[0].set_xticks(list(levels))
 
@@ -2332,7 +2577,7 @@ def analyze_afm_image(
     save_csv: bool = True
 ) -> pd.DataFrame:
     """
-    Complete AFM surface analysis pipeline (v1.1.1).
+    Complete AFM surface analysis pipeline (v1.2.0).
 
     Parameters
     ----------
@@ -2353,6 +2598,13 @@ def analyze_afm_image(
     -------
     results_df : pd.DataFrame
         Single-row DataFrame with all computed metrics.
+
+    Notes
+    -----
+    OPD_Energy_Gap and OPD_Dominant_Scale are set to NaN in the
+    output because they are image-independent constants under the
+    current OPD recursion (see v1.2.0 changelog). Fractal_Dim is
+    now computed via PSD-slope estimation and varies per image.
 
     Examples
     --------
@@ -2388,7 +2640,7 @@ def analyze_afm_image(
         f"Z range: {image.min():.2f} to {image.max():.2f} nm"
     )
 
-    logger.info("Computing roughness metrics...")
+    logger.info("Computing roughness metrics (including PSD fractal dim)...")
     roughness = calculate_roughness_metrics(image)
 
     logger.info("Computing power spectral density...")
@@ -2409,7 +2661,7 @@ def analyze_afm_image(
         fourier['cv_fourier'], pip['cv_pip']
     )
 
-    logger.info("Running OPD decomposition...")
+    logger.info("Running OPD decomposition (for spectrum plot only)...")
     opd = orthogonal_pdf_decomposition(image)
 
     logger.info("Running multiscale directional analysis...")
@@ -2459,6 +2711,7 @@ def analyze_afm_image(
         'Rt_Robust_nm': roughness['Rt_Robust_nm'],
         'Rsk': roughness['Rsk'],
         'Rku': roughness['Rku'],
+        # v1.2.0: Fractal_Dim now varies per image (PSD-slope method)
         'Fractal_Dim': roughness['Fractal_Dim'],
 
         'Mean_PSD_nm2': fourier['mean_psd'],
@@ -2474,8 +2727,11 @@ def analyze_afm_image(
         'HI': hi,
         'HI_Radial': hi_radial,
 
-        'OPD_Energy_Gap': opd['energy_gap'],
-        'OPD_Dominant_Scale': opd['dominant_scale'],
+        # v1.2.0: OPD outputs set to NaN — both are image-independent
+        # constants under the current OPD recursion and must not be
+        # interpreted biologically until the recursion is corrected.
+        'OPD_Energy_Gap': np.nan,
+        'OPD_Dominant_Scale': np.nan,
 
         'Wavelet_Complexity_bits': ms['summary']['wavelet_complexity'],
         'Scale_Heterogeneity_Index': ms['summary']['scale_heterogeneity_index'],
@@ -2525,34 +2781,55 @@ def save_results_excel(
         ws = wb.create_sheet("Units_Legend")
 
         legend = [
-            ("Ra_nm", "nm", "Arithmetic mean roughness (ISO 4287)"),
-            ("Rq_nm", "nm", "Root mean square roughness (ISO 4287)"),
-            ("Rt_nm", "nm", "Maximum peak-to-valley height (ISO 4287 strict)"),
+            ("Ra_nm", "nm",
+             "Arithmetic mean roughness (ISO 4287)"),
+            ("Rq_nm", "nm",
+             "Root mean square roughness (ISO 4287)"),
+            ("Rt_nm", "nm",
+             "Maximum peak-to-valley height (ISO 4287 strict)"),
             ("Rt_Robust_nm", "nm",
              "Robust peak-to-valley P99.5-P0.5: spike-resistant"),
             ("Rsk", "dimensionless",
              "Skewness with Fisher-Pearson bias correction"),
             ("Rku", "dimensionless",
              "Excess kurtosis with Pearson bias correction"),
-            ("Fractal_Dim", "dimensionless", "OPD-derived fractal dimension"),
-            ("Mean_PSD_nm2", "nm^2", "2D mean power spectral density"),
-            ("Mean_PSD_Radial_nm2", "nm^2", "Radially averaged PSD mean"),
-            ("CV_Fourier_pct", "%", "Angular CV of PSD directional sectors"),
-            ("Delta_PIP_nm", "nm", "Height range: P95 - P5"),
-            ("CV_PIP_pct", "%", "std(filtered heights) / delta_pip * 100%"),
-            ("PDI", "dimensionless", "CV_Fourier / CV_PIP"),
+            ("Fractal_Dim", "dimensionless",
+             "PSD-derived surface fractal dimension "
+             "(D_f = 4 - beta/2, fitted from radial PSD log-log slope; "
+             "v1.2.0 replaces previous constant OPD-derived value)"),
+            ("Mean_PSD_nm2", "nm^2",
+             "2D mean power spectral density"),
+            ("Mean_PSD_Radial_nm2", "nm^2",
+             "Radially averaged PSD mean"),
+            ("CV_Fourier_pct", "%",
+             "Angular CV of PSD directional sectors"),
+            ("Delta_PIP_nm", "nm",
+             "Height range: P95 - P5"),
+            ("CV_PIP_pct", "%",
+             "std(filtered heights) / delta_pip * 100%"),
+            ("PDI", "dimensionless",
+             "CV_Fourier / CV_PIP"),
             ("HI", "dimensionless",
              "(delta_PIP/sqrt(PSD_mean)) * ln(PDI)"),
-            ("HI_Radial", "dimensionless", "HI using radial PSD mean"),
-            ("OPD_Energy_Gap", "dimensionless", "OPD energy gap E[0] - E[1]"),
+            ("HI_Radial", "dimensionless",
+             "HI using radial PSD mean"),
+            ("OPD_Energy_Gap", "dimensionless",
+             "NOT CURRENTLY INFORMATIVE: OPD recursion reduces to "
+             "uniform PDF scaling; value fixed to NaN in v1.2.0. "
+             "Do not interpret until OPD recursion is corrected."),
+            ("OPD_Dominant_Scale", "dimensionless",
+             "NOT CURRENTLY INFORMATIVE: fixed to NaN in v1.2.0 "
+             "for the same reason as OPD_Energy_Gap."),
             ("Wavelet_Complexity_bits", "bits",
              "Shannon entropy of wavelet energy"),
             ("Scale_Heterogeneity_Index", "dimensionless",
              "CV of scale-dependent CV values"),
             ("Anisotropy_Index", "dimensionless",
-             "Directional power range"),
+             "Directional power range — informative; "
+             "varies with image structure"),
             ("Primary_Direction_deg", "degrees",
-             "Dominant surface orientation"),
+             "Dominant surface orientation — interpret only if all "
+             "samples were mounted in the same physical orientation"),
         ]
 
         ws.append(["Column Name", "Unit", "Description", "Method"])
@@ -2593,7 +2870,7 @@ def main():
         logger.error(
             "GUI mode requires tkinter. "
             "Please use the programmatic API:\n"
-            "  from afmanalyzer import analyze_afm_image\n"
+            "  from SPHEX_1_Core import analyze_afm_image\n"
             "  df = analyze_afm_image('image.tif', pixel_size_nm=19.53)"
         )
         return
@@ -2759,9 +3036,7 @@ def main():
             scan_size_nm = manual_result['ss']
 
         try:
-            pixel_size_nm = validate_pixel_size(
-                pixel_size_nm, "main"
-            )
+            pixel_size_nm = validate_pixel_size(pixel_size_nm, "main")
         except PhysicalUnitError as e:
             messagebox.showerror("Invalid Pixel Size", str(e))
             return
