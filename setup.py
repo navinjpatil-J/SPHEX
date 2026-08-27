@@ -1,30 +1,44 @@
-from setuptools import setup, find_packages
+"""Setuptools configuration for the script-based SPHEX v1.2.0 release."""
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+from pathlib import Path
+
+from setuptools import setup
+
+ROOT = Path(__file__).resolve().parent
+README = ROOT / "README.md"
+
 
 setup(
     name="SPHEX",
-    version="1.1.1",
+    version="1.2.0",
     author="Navinkumar Patil",
     author_email="navinjpatil@gmail.com",
     description=(
         "SPHEX: Spectral Pattern Heterogeneity indeX Analyzer — "
-        "A multiscale framework for quantitative AFM biofilm "
+        "a multiscale framework for quantitative AFM biofilm "
         "surface heterogeneity analysis"
     ),
-    long_description=long_description,
+    long_description=README.read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     url="https://github.com/navinjpatil-J/SPHEX",
-    packages=find_packages(),
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
-        "Operating System :: OS Independent",
-        "Intended Audience :: Science/Research",
-        "Topic :: Scientific/Engineering :: Image Processing",
-        "Topic :: Scientific/Engineering :: Physics",
+    project_urls={
+        "Source": "https://github.com/navinjpatil-J/SPHEX",
+        "Issues": "https://github.com/navinjpatil-J/SPHEX/issues",
+    },
+    license="MIT",
+    license_files=["LICENSE"],
+
+    # The repository currently has a flat module layout, not a package
+    # directory with __init__.py. Therefore find_packages() returns [] and
+    # must not be used here. py_modules makes `pip install .` install the
+    # importable SPHEX modules correctly.
+    py_modules=[
+        "SPHEX_1_Core",
+        "SPHEX_2_Ideal_Surfaces",
+        "SPHEX_3_Validation_Suite",
+        "SPHEX_4_Run_Validation",
     ],
+
     python_requires=">=3.8",
     install_requires=[
         "numpy>=1.21.0",
@@ -36,4 +50,31 @@ setup(
         "pandas>=1.3.0",
         "openpyxl>=3.0.0",
     ],
+    entry_points={
+        "console_scripts": [
+            "sphex=SPHEX_1_Core:main",
+            "sphex-validate=SPHEX_3_Validation_Suite:run_full_validation",
+        ],
+    },
+    classifiers=[
+        "Intended Audience :: Science/Research",
+        "Operating System :: OS Independent",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Scientific/Engineering :: Image Processing",
+        "Topic :: Scientific/Engineering :: Physics",
+    ],
+    keywords=[
+        "AFM",
+        "atomic force microscopy",
+        "biofilm",
+        "surface roughness",
+        "power spectral density",
+        "mathematical biology",
+    ],
+    zip_safe=False,
 )
